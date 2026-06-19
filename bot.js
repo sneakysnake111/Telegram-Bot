@@ -280,6 +280,12 @@ cron.schedule('* * * * *', async () => {
   const winStart = nowMins + 165  // 2h45m from now
   const winEnd   = nowMins + 180  // 3h00m from now
 
+  // Pre-compute tomorrow in case the window crosses midnight
+  const tomorrowDate = new Date(now)
+  tomorrowDate.setDate(tomorrowDate.getDate() + 1)
+  const tomorrowStr = toDateStr(tomorrowDate)
+  const tomorrowDay = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][tomorrowDate.getDay()]
+
   // ── A. Cancellation notifications (highest priority) ─────────────────────
   try {
     const { rows: canceled } = await query(
@@ -331,52 +337,66 @@ cron.schedule('* * * * *', async () => {
 
   // ── B. Lesson reminders (only if not already notified) ────────────────────
   try {
-    const { rows: slots } = await query(
-      `SELECT sss.student_key, sss.student_name, sss.teacher_name, sss.lesson_time,
-              br.chat_id
-       FROM student_schedule_slots sss
-       INNER JOIN parent_student_links psl ON psl.student_key = sss.student_key
-       INNER JOIN bot_registrations br ON br.telegram_username = psl.telegram_username
-       WHERE sss.day_of_week = $1 AND sss.lesson_time != ''`,
-      [day]
-    )
-
-    for (const slot of slots) {
-      const [h, m] = slot.lesson_time.split(':').map(Number)
-      if (isNaN(h) || isNaN(m)) continue
-      const lessonMins = h * 60 + m
-      if (lessonMins < winStart || lessonMins > winEnd) continue
-
-      // Skip if already notified today (reminder or cancellation)
-      const { rows: alreadySent } = await query(
-        'SELECT 1 FROM lesson_reminders_sent WHERE student_key = $1 AND lesson_date = $2',
-        [slot.student_key, todayStr]
+    // Helper: query slots for a given day and send reminders
+    async function processReminderSlots(dayName, lessonDate, crossMidnight) {
+      const { rows: slots } = await query(
+        `SELECT sss.student_key, sss.student_name, sss.teacher_name, sss.lesson_time,
+                br.chat_id
+         FROM student_schedule_slots sss
+         INNER JOIN parent_student_links psl ON psl.student_key = sss.student_key
+         INNER JOIN bot_registrations br ON br.telegram_username = psl.telegram_username
+         WHERE sss.day_of_week = $1 AND sss.lesson_time != ''`,
+        [dayName]
       )
-      if (alreadySent.length > 0) continue
 
-      try {
-        await bot.telegram.sendMessage(
-          slot.chat_id,
-          `⏰ <b>Lesson reminder</b>\n\n` +
-          `📚 <b>${slot.student_name}</b> has a lesson today at <b>${slot.lesson_time}</b>\n` +
-          `👩‍🏫 Teacher: ${slot.teacher_name}\n\nSee you in 3 hours! 🎵`,
-          {
-            parse_mode: 'HTML',
-            reply_markup: Markup.inlineKeyboard([
-              [Markup.button.callback('📅 Full schedule', 'show_schedule')]
-            ]).reply_markup,
-          }
+      for (const slot of slots) {
+        const [h, m] = slot.lesson_time.split(':').map(Number)
+        if (isNaN(h) || isNaN(m)) continue
+        // For cross-midnight slots, shift lesson minutes by +1440 so they
+        // fall in the same numeric range as winStart/winEnd (which exceed 1440)
+        const lessonMins = h * 60 + m + (crossMidnight ? 1440 : 0)
+        if (lessonMins < winStart || lessonMins > winEnd) continue
+
+        // Skip if already notified for this lesson date
+        const { rows: alreadySent } = await query(
+          'SELECT 1 FROM lesson_reminders_sent WHERE student_key = $1 AND lesson_date = $2',
+          [slot.student_key, lessonDate]
         )
-        console.log(`[cron] reminder sent: ${slot.student_name} ${slot.lesson_time}`)
-      } catch (err) {
-        console.error(`[cron] reminder send failed:`, err.message)
-        continue
-      }
+        if (alreadySent.length > 0) continue
 
-      await query(
-        'INSERT INTO lesson_reminders_sent (student_key, lesson_date) VALUES ($1, $2) ON CONFLICT DO NOTHING',
-        [slot.student_key, todayStr]
-      )
+        const whenLabel = crossMidnight ? 'tomorrow' : 'today'
+        try {
+          await bot.telegram.sendMessage(
+            slot.chat_id,
+            `⏰ <b>Lesson reminder</b>\n\n` +
+            `📚 <b>${slot.student_name}</b> has a lesson ${whenLabel} at <b>${slot.lesson_time}</b>\n` +
+            `👩‍🏫 Teacher: ${slot.teacher_name}\n\nSee you in 3 hours! 🎵`,
+            {
+              parse_mode: 'HTML',
+              reply_markup: Markup.inlineKeyboard([
+                [Markup.button.callback('📅 Full schedule', 'show_schedule')]
+              ]).reply_markup,
+            }
+          )
+          console.log(`[cron] reminder sent: ${slot.student_name} ${slot.lesson_time} (${lessonDate})`)
+        } catch (err) {
+          console.error(`[cron] reminder send failed:`, err.message)
+          continue
+        }
+
+        await query(
+          'INSERT INTO lesson_reminders_sent (student_key, lesson_date) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+          [slot.student_key, lessonDate]
+        )
+      }
+    }
+
+    // Today's slots (normal case)
+    await processReminderSlots(day, todayStr, false)
+
+    // Tomorrow's slots — only needed when the 3-hour window crosses midnight
+    if (winEnd > 1440) {
+      await processReminderSlots(tomorrowDay, tomorrowStr, true)
     }
   } catch (err) {
     console.error('[cron] reminder error:', err.message)
