@@ -12,7 +12,7 @@ const DATABASE_URL = process.env.DATABASE_URL
 
 if (!BOT_TOKEN) throw new Error('Missing BOT_TOKEN')
 if (!DATABASE_URL) throw new Error('Missing DATABASE_URL')
-
+process.env.TZ = "Europe/Kyiv"
 const bot = new Telegraf(BOT_TOKEN)
 const app = express()
 
@@ -223,7 +223,7 @@ function parseDateTime(dateStr, timeStr) {
 
 const diffMin = (lessonDateTime - now) / 60000
 
-if (diffMin < 175 || diffMin > 185) continue
+if (diffMin < 120 || diffMin > 180) continue
 
       const key = `rem_${slot.student_key}_${today}`
       if (sentLog.has(key)) continue
