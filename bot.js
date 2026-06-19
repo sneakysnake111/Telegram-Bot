@@ -1,196 +1,394 @@
+/**
+ * Telegram Lesson Reminder Bot
+ * ─────────────────────────────
+ * Stack: Node.js 18+, Telegraf, pg, node-cron
+ *
+ * Install:
+ *   npm install telegraf pg node-cron dotenv
+ *
+ * .env:
+ *   BOT_TOKEN    = token from @BotFather
+ *   DATABASE_URL = postgresql://postgres.xxx:PASSWORD@aws-1-eu-central-1.pooler.supabase.com:5432/postgres
+ *
+ * Run:  node bot.js
+ */
+
 require('dotenv').config()
 const { Telegraf, Markup } = require('telegraf')
 const { Client } = require('pg')
 const cron = require('node-cron')
 
-// ───────── CONFIG ─────────
-const BOT_TOKEN = process.env.BOT_TOKEN
+// ── Config ────────────────────────────────────────────────────────────────────
+
+const BOT_TOKEN    = process.env.BOT_TOKEN
 const DATABASE_URL = process.env.DATABASE_URL
 
-if (!BOT_TOKEN) throw new Error('Missing BOT_TOKEN')
-if (!DATABASE_URL) throw new Error('Missing DATABASE_URL')
+if (!BOT_TOKEN)    throw new Error('Missing BOT_TOKEN in .env')
+if (!DATABASE_URL) throw new Error('Missing DATABASE_URL in .env')
 
 const bot = new Telegraf(BOT_TOKEN)
 
-// ───────── DB ─────────
+// ── DB: single Client with auto-reconnect ────────────────────────────────────
+
 let db = null
 
 async function getDb() {
   if (db) return db
-
   const client = new Client({
     connectionString: DATABASE_URL,
-    ssl: { rejectUnauthorized: false }
+    ssl: { rejectUnauthorized: false },
   })
-
   await client.connect()
-
   client.on('error', (err) => {
-    console.error('[db error]', err.message)
+    console.error('[db] connection error, will reconnect:', err.message)
     db = null
     client.end().catch(() => {})
   })
-
   db = client
+  console.log('[db] connected to Supabase')
   return db
 }
 
 async function query(text, values = []) {
-  const client = await getDb()
-  return client.query(text, values)
+  try {
+    const client = await getDb()
+    return await client.query({ text, values })
+  } catch (err) {
+    if (err.code === 'ECONNRESET' || err.code === '57P01' || err.code === '08006') {
+      console.warn('[db] reconnecting…')
+      db = null
+      const client = await getDb()
+      return client.query({ text, values })
+    }
+    throw err
+  }
 }
 
-// ───────── HELPERS ─────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
 function todayDayName() {
-  return ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][new Date().getDay()]
+  return ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][new Date().getDay()]
 }
 
 function toDateStr(date = new Date()) {
-  return date.toISOString().slice(0,10)
+  return date.toISOString().slice(0, 10)
 }
 
-function formatDate(d) {
-  return d.slice(8,10) + '.' + d.slice(5,7) + '.' + d.slice(0,4)
+function formatDate(isoDate) {
+  const [y, m, d] = String(isoDate).slice(0, 10).split('-')
+  return `${d}.${m}.${y}`
 }
 
-async function safeSend(chatId, text, opts = {}) {
-  try {
-    await bot.telegram.sendMessage(chatId, text, {
-      parse_mode: 'HTML',
-      ...opts
-    })
-  } catch (e) {
-    console.error('[telegram]', e.message)
-  }
-}
+// ── /start → show Subscribe button ───────────────────────────────────────────
 
-// ───────── BOT START ─────────
 bot.start(async (ctx) => {
-  const u = ctx.from.username
-  if (!u) return ctx.reply('Set Telegram username first')
+  const rawUsername = ctx.from.username
 
-  await ctx.reply('Welcome!', Markup.inlineKeyboard([
-    Markup.button.callback('Subscribe', 'sub')
-  ]))
+  if (!rawUsername) {
+    return ctx.replyWithHTML(
+      '❌ <b>No Telegram username set.</b>\n\n' +
+      'Please set one in <i>Settings → Username</i>, then send /start again.'
+    )
+  }
+
+  await ctx.replyWithHTML(
+    '👋 <b>Welcome to the Lesson Bot!</b>\n\n' +
+    'Press <b>Subscribe</b> below to start receiving lesson reminders and cancellation alerts.',
+    Markup.inlineKeyboard([
+      [Markup.button.callback('✅ Subscribe', 'do_subscribe')]
+    ])
+  )
 })
 
-// ───────── SUBSCRIBE ─────────
-bot.action('sub', async (ctx) => {
+// ── Button: Subscribe ─────────────────────────────────────────────────────────
+
+bot.action('do_subscribe', async (ctx) => {
   await ctx.answerCbQuery()
 
+  const rawUsername = ctx.from.username
+  const chatId = ctx.chat.id
+
+  if (!rawUsername) {
+    return ctx.replyWithHTML('❌ No Telegram username found. Please set one and try /start again.')
+  }
+
+  const username = rawUsername.toLowerCase()
+  console.log(`[subscribe] username=${username} chatId=${chatId}`)
+
+  let links
+  try {
+    const result = await query(
+      'SELECT student_name, teacher_name FROM parent_student_links WHERE telegram_username = $1',
+      [username]
+    )
+    links = result.rows
+  } catch (err) {
+    console.error('[subscribe] DB error:', err.message)
+    return ctx.replyWithHTML('⚠️ Database error. Please try again.')
+  }
+
+  if (links.length === 0) {
+    return ctx.replyWithHTML(
+      `❌ <b>@${username}</b> is not registered in the system.\n\n` +
+      `Ask the administrator to:\n` +
+      `1. Add your @username in the <b>Parents</b> page\n` +
+      `2. Click <b>Sync to Bot DB</b> on the Bot page\n\n` +
+      `Then press Subscribe again.`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback('🔄 Try again', 'do_subscribe')]
+      ])
+    )
+  }
+
+  try {
+    await query(
+      `INSERT INTO bot_registrations (telegram_username, chat_id)
+       VALUES ($1, $2)
+       ON CONFLICT (telegram_username) DO UPDATE
+         SET chat_id = EXCLUDED.chat_id, registered_at = NOW()`,
+      [username, chatId]
+    )
+  } catch (err) {
+    console.error('[subscribe] registration error:', err.message)
+    return ctx.replyWithHTML('⚠️ Could not complete registration. Please try again.')
+  }
+
+  const studentList = links
+    .map(r => `• <b>${r.student_name}</b> — ${r.teacher_name}`)
+    .join('\n')
+
+  await ctx.replyWithHTML(
+    `✅ <b>Subscribed!</b>\n\nYou will receive reminders for:\n${studentList}\n\n` +
+    `📬 Reminders arrive <b>3 hours before</b> each lesson.\n` +
+    `🚫 Cancellations are sent immediately.`,
+    Markup.inlineKeyboard([
+      [Markup.button.callback('📅 My schedule',      'show_schedule')],
+      [Markup.button.callback('🚫 Canceled lessons', 'show_canceled')],
+    ])
+  )
+})
+
+// ── Button: show schedule ─────────────────────────────────────────────────────
+
+bot.action('show_schedule', async (ctx) => {
+  await ctx.answerCbQuery()
   const username = ctx.from.username?.toLowerCase()
   if (!username) return
 
-  const chatId = ctx.chat.id
-
   const { rows } = await query(
-    'SELECT student_name FROM parent_student_links WHERE telegram_username=$1',
+    `SELECT psl.student_name, psl.teacher_name, sss.day_of_week, sss.lesson_time
+     FROM parent_student_links psl
+     LEFT JOIN student_schedule_slots sss ON sss.student_key = psl.student_key
+     WHERE psl.telegram_username = $1
+     ORDER BY psl.student_name, sss.day_of_week`,
     [username]
   )
 
-  if (!rows.length)
-    return ctx.reply('Not registered')
+  if (rows.length === 0) {
+    return ctx.replyWithHTML(
+      '📅 No schedule set yet.',
+      Markup.inlineKeyboard([[Markup.button.callback('« Menu', 'back_to_menu')]])
+    )
+  }
 
-  await query(`
-    INSERT INTO bot_registrations (telegram_username, chat_id)
-    VALUES ($1,$2)
-    ON CONFLICT (telegram_username)
-    DO UPDATE SET chat_id=EXCLUDED.chat_id
-  `, [username, chatId])
+  const byStudent = {}
+  for (const row of rows) {
+    if (!byStudent[row.student_name]) {
+      byStudent[row.student_name] = { teacher: row.teacher_name, slots: [] }
+    }
+    if (row.day_of_week) {
+      const time = row.lesson_time ? ` <b>${row.lesson_time}</b>` : ''
+      byStudent[row.student_name].slots.push(`${row.day_of_week}${time}`)
+    }
+  }
 
-  await ctx.reply('Subscribed')
+  const lines = Object.entries(byStudent).map(([name, data]) => {
+    const days = data.slots.length ? data.slots.join(' · ') : 'No days set'
+    return `👤 <b>${name}</b> (${data.teacher})\n   📆 ${days}`
+  })
+
+  await ctx.replyWithHTML(
+    `📅 <b>Schedule</b>\n\n${lines.join('\n\n')}`,
+    Markup.inlineKeyboard([
+      [Markup.button.callback('🚫 Canceled lessons', 'show_canceled')],
+      [Markup.button.callback('« Menu',             'back_to_menu')],
+    ])
+  )
 })
 
-// ───────── CRON LOCK ─────────
-let cronRunning = false
+// ── Button: show canceled ─────────────────────────────────────────────────────
 
-// ───────── CRON ─────────
+bot.action('show_canceled', async (ctx) => {
+  await ctx.answerCbQuery()
+  const username = ctx.from.username?.toLowerCase()
+  if (!username) return
+
+  const today = toDateStr()
+  const { rows } = await query(
+    `SELECT cl.student_name, cl.teacher_name, cl.canceled_date
+     FROM canceled_lessons cl
+     INNER JOIN parent_student_links psl ON psl.student_key = cl.student_key
+     WHERE psl.telegram_username = $1 AND cl.canceled_date >= $2
+     ORDER BY cl.canceled_date`,
+    [username, today]
+  )
+
+  if (rows.length === 0) {
+    return ctx.replyWithHTML(
+      '✅ No upcoming canceled lessons.',
+      Markup.inlineKeyboard([[Markup.button.callback('« Menu', 'back_to_menu')]])
+    )
+  }
+
+  const lines = rows.map(r =>
+    `🚫 <b>${r.student_name}</b>\n   📅 ${formatDate(r.canceled_date)} — ${r.teacher_name}`
+  )
+
+  await ctx.replyWithHTML(
+    `🚫 <b>Canceled lessons</b>\n\n${lines.join('\n\n')}`,
+    Markup.inlineKeyboard([
+      [Markup.button.callback('📅 Schedule', 'show_schedule')],
+      [Markup.button.callback('« Menu',      'back_to_menu')],
+    ])
+  )
+})
+
+// ── Button: back to menu ──────────────────────────────────────────────────────
+
+bot.action('back_to_menu', async (ctx) => {
+  await ctx.answerCbQuery()
+  await ctx.replyWithHTML(
+    '📚 <b>Main menu</b>',
+    Markup.inlineKeyboard([
+      [Markup.button.callback('📅 My schedule',      'show_schedule')],
+      [Markup.button.callback('🚫 Canceled lessons', 'show_canceled')],
+    ])
+  )
+})
+
+// ── Cron: every minute ────────────────────────────────────────────────────────
+// One combined cron handles both reminders and cancellations.
+// Only ONE notification per lesson per day is sent:
+//   • If lesson is canceled today → cancellation only (reminder suppressed)
+//   • If lesson is not canceled   → reminder 3 h before (once per day)
+
 cron.schedule('* * * * *', async () => {
-  if (cronRunning) return
-  cronRunning = true
+  const now      = new Date()
+  const todayStr = toDateStr(now)
+  const day      = todayDayName()
+  const nowMins  = now.getHours() * 60 + now.getMinutes()
+  const winStart = nowMins + 165  // 2h45m from now
+  const winEnd   = nowMins + 180  // 3h00m from now
 
+  // ── A. Cancellation notifications (highest priority) ─────────────────────
   try {
-    const now = new Date()
-    const todayStr = toDateStr(now)
-    const day = todayDayName()
+    const { rows: canceled } = await query(
+      `SELECT cl.student_key, cl.student_name, cl.teacher_name,
+              cl.canceled_date::text AS canceled_date,
+              br.chat_id
+       FROM canceled_lessons cl
+       INNER JOIN parent_student_links psl ON psl.student_key = cl.student_key
+       INNER JOIN bot_registrations br ON br.telegram_username = psl.telegram_username
+       WHERE cl.notification_sent = FALSE`
+    )
 
-    // ───────── CANCELLATIONS ─────────
-    const canceled = await query(`
-      SELECT cl.student_key, cl.student_name, cl.teacher_name,
-             cl.canceled_date::text, br.chat_id
-      FROM canceled_lessons cl
-      JOIN parent_student_links psl ON psl.student_key=cl.student_key
-      JOIN bot_registrations br ON br.telegram_username=psl.telegram_username
-      WHERE cl.notification_sent=false
-    `)
+    for (const row of canceled) {
+      try {
+        await bot.telegram.sendMessage(
+          row.chat_id,
+          `🚫 <b>Lesson canceled</b>\n\n` +
+          `The lesson for <b>${row.student_name}</b> on <b>${formatDate(row.canceled_date)}</b> is canceled.\n` +
+          `👩‍🏫 Teacher: ${row.teacher_name}`,
+          {
+            parse_mode: 'HTML',
+            reply_markup: Markup.inlineKeyboard([
+              [Markup.button.callback('🚫 All cancellations', 'show_canceled')],
+              [Markup.button.callback('📅 My schedule',       'show_schedule')],
+            ]).reply_markup,
+          }
+        )
+        console.log(`[cron] cancellation sent: ${row.student_name} ${row.canceled_date}`)
+      } catch (err) {
+        console.error(`[cron] cancellation send failed:`, err.message)
+        continue
+      }
 
-    for (const c of canceled.rows) {
-      await safeSend(c.chat_id,
-        `🚫 Lesson canceled\n${c.student_name} ${formatDate(c.canceled_date)}`
+      // Mark cancellation notified
+      await query(
+        'UPDATE canceled_lessons SET notification_sent = TRUE WHERE student_key = $1 AND canceled_date = $2',
+        [row.student_key, row.canceled_date]
       )
 
+      // Also suppress any reminder for this lesson today — one notification only
       await query(
-        'UPDATE canceled_lessons SET notification_sent=true WHERE student_key=$1 AND canceled_date=$2',
-        [c.student_key, c.canceled_date]
-      )
-
-      await query(
-        'INSERT INTO lesson_reminders_sent VALUES ($1,$2) ON CONFLICT DO NOTHING',
-        [c.student_key, c.canceled_date]
+        'INSERT INTO lesson_reminders_sent (student_key, lesson_date) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+        [row.student_key, row.canceled_date]
       )
     }
+  } catch (err) {
+    console.error('[cron] cancellation error:', err.message)
+  }
 
-    // ───────── LESSONS ─────────
-    const res = await query(`
-      SELECT sss.student_key, sss.student_name, sss.teacher_name,
-             sss.lesson_time, br.chat_id
-      FROM student_schedule_slots sss
-      JOIN parent_student_links psl ON psl.student_key=sss.student_key
-      JOIN bot_registrations br ON br.telegram_username=psl.telegram_username
-      WHERE sss.day_of_week=$1
-    `, [day])
+  // ── B. Lesson reminders (only if not already notified) ────────────────────
+  try {
+    const { rows: slots } = await query(
+      `SELECT sss.student_key, sss.student_name, sss.teacher_name, sss.lesson_time,
+              br.chat_id
+       FROM student_schedule_slots sss
+       INNER JOIN parent_student_links psl ON psl.student_key = sss.student_key
+       INNER JOIN bot_registrations br ON br.telegram_username = psl.telegram_username
+       WHERE sss.day_of_week = $1 AND sss.lesson_time != ''`,
+      [day]
+    )
 
-    for (const s of res.rows) {
+    for (const slot of slots) {
+      const [h, m] = slot.lesson_time.split(':').map(Number)
+      if (isNaN(h) || isNaN(m)) continue
+      const lessonMins = h * 60 + m
+      if (lessonMins < winStart || lessonMins > winEnd) continue
 
-      const [h,m] = s.lesson_time.split(':').map(Number)
-
-      const lessonDate = new Date(now)
-      lessonDate.setHours(h,m,0,0)
-
-      const diffMin = (lessonDate - now) / 60000
-
-      // 2.5h - 4h window (stable)
-      if (diffMin < 150 || diffMin > 240) continue
-
-      const already = await query(
-        'SELECT 1 FROM lesson_reminders_sent WHERE student_key=$1 AND lesson_date=$2',
-        [s.student_key, todayStr]
+      // Skip if already notified today (reminder or cancellation)
+      const { rows: alreadySent } = await query(
+        'SELECT 1 FROM lesson_reminders_sent WHERE student_key = $1 AND lesson_date = $2',
+        [slot.student_key, todayStr]
       )
+      if (alreadySent.length > 0) continue
 
-      if (already.rows.length) continue
-
-      await safeSend(s.chat_id,
-        `⏰ Lesson reminder\n${s.student_name} at ${s.lesson_time}`
-      )
+      try {
+        await bot.telegram.sendMessage(
+          slot.chat_id,
+          `⏰ <b>Lesson reminder</b>\n\n` +
+          `📚 <b>${slot.student_name}</b> has a lesson today at <b>${slot.lesson_time}</b>\n` +
+          `👩‍🏫 Teacher: ${slot.teacher_name}\n\nSee you in 3 hours! 🎵`,
+          {
+            parse_mode: 'HTML',
+            reply_markup: Markup.inlineKeyboard([
+              [Markup.button.callback('📅 Full schedule', 'show_schedule')]
+            ]).reply_markup,
+          }
+        )
+        console.log(`[cron] reminder sent: ${slot.student_name} ${slot.lesson_time}`)
+      } catch (err) {
+        console.error(`[cron] reminder send failed:`, err.message)
+        continue
+      }
 
       await query(
-        'INSERT INTO lesson_reminders_sent (student_key, lesson_date) VALUES ($1,$2)',
-        [s.student_key, todayStr]
+        'INSERT INTO lesson_reminders_sent (student_key, lesson_date) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+        [slot.student_key, todayStr]
       )
     }
-
-  } catch (e) {
-    console.error('[cron]', e)
-  } finally {
-    cronRunning = false
+  } catch (err) {
+    console.error('[cron] reminder error:', err.message)
   }
 })
 
-// ───────── START BOT ─────────
+// ── Launch ────────────────────────────────────────────────────────────────────
+
 getDb()
   .then(() => bot.launch())
-  .then(() => console.log('Bot running'))
-  .catch(e => console.error(e))
+  .then(() => console.log('🤖 Bot is running'))
+  .catch((err) => { console.error('Failed to start:', err.message); process.exit(1) })
 
-process.once('SIGINT', () => bot.stop('SIGINT'))
+process.once('SIGINT',  () => bot.stop('SIGINT'))
 process.once('SIGTERM', () => bot.stop('SIGTERM'))
