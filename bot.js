@@ -278,7 +278,7 @@ cron.schedule('* * * * *', async () => {
   const todayStr = toDateStr(now)
   const day      = todayDayName()
   const nowMins  = now.getHours() * 60 + now.getMinutes()
-  const winStart = nowMins + 165  // 2h45m from now
+  const winStart = nowMins + 150  // 2h30m from now
   const winEnd   = nowMins + 180  // 3h00m from now
 
   // ── A. Cancellation notifications (highest priority) ─────────────────────
