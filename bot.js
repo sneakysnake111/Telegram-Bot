@@ -158,16 +158,16 @@ cron.schedule('* * * * *', async () => {
   lastCronRun = nowTs
 
   try {
-    const now = new Date()
-    const today = toDateStr(now)
-    const day = todayDayName()
-    const nowMins = now.getHours()*60 + now.getMinutes()
+   const now = new Date()
 
-    const targetMin = nowMins + 180
-    const tolerance = 5
+const today = toDateStr(now)
+const day = todayDayName()
 
-    const winStart = targetMin - tolerance
-    const winEnd = targetMin + tolerance
+const tolerance = 5 // хвилин
+
+function parseDateTime(dateStr, timeStr) {
+  return new Date(`${dateStr}T${timeStr}:00`)
+}
 
     sentLog.clear()
 
@@ -219,10 +219,11 @@ cron.schedule('* * * * *', async () => {
 
     for (const slot of slots.rows) {
 
-      const [h,m] = slot.lesson_time.split(':').map(Number)
-      const lessonMins = h*60 + m
+      const lessonDateTime = parseDateTime(today, slot.lesson_time)
 
-      if (lessonMins < winStart || lessonMins > winEnd) continue
+const diffMin = (lessonDateTime - now) / 60000
+
+if (diffMin < 175 || diffMin > 185) continue
 
       const key = `rem_${slot.student_key}_${today}`
       if (sentLog.has(key)) continue
