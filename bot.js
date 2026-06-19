@@ -7,8 +7,8 @@
  *   npm install telegraf pg node-cron dotenv
  *
  * .env:
- *   BOT_TOKEN    = 8245162561:AAG9m57ksCJoBHQ-C-rjfZBFpmjnVDGG58Q
- *   DATABASE_URL = postgresql://postgres.xxx:ZhUQ3IT4MIyirUIG@aws-1-eu-central-1.pooler.supabase.com:5432/postgres
+ *   BOT_TOKEN=твій_новий_токен_від_BotFather
+*    DATABASE_URL=postgresql://user:password@host:5432/db
  *
  /**
  * Run:  node bot.js
