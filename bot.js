@@ -18,7 +18,7 @@ require('dotenv').config()
 const { Telegraf, Markup } = require('telegraf')
 const { Client } = require('pg')
 const cron = require('node-cron')
-
+const express = require('express')
 // ── Config ────────────────────────────────────────────────────────────────────
 
 const BOT_TOKEN    = process.env.BOT_TOKEN
@@ -385,6 +385,18 @@ cron.schedule('* * * * *', async () => {
 })
 
 // ── Launch ────────────────────────────────────────────────────────────────────
+const express = require('express')
+const app = express()
+
+app.get('/', (req, res) => {
+  res.send('Bot is running')
+})
+
+const PORT = process.env.PORT || 10000
+
+app.listen(PORT, () => {
+  console.log(`Server listening on ${PORT}`)
+})
 
 getDb()
   .then(() => bot.launch())
