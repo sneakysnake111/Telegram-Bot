@@ -79,6 +79,16 @@ function formatDate(isoDate) {
   const [y, m, d] = String(isoDate).slice(0, 10).split('-')
   return `${d}.${m}.${y}`
 }
+async function safeSend(chatId, text, opts = {}) {
+  try {
+    return await bot.telegram.sendMessage(chatId, text, {
+      parse_mode: 'HTML',
+      ...opts
+    })
+  } catch (err) {
+    console.error('[telegram error]', err.message)
+  }
+}
 
 // ── /start → show Subscribe button ───────────────────────────────────────────
 
@@ -274,12 +284,96 @@ bot.action('back_to_menu', async (ctx) => {
 //   • If lesson is not canceled   → reminder 3 h before (once per day)
 
 cron.schedule('* * * * *', async () => {
-  const now      = new Date()
-  const todayStr = toDateStr(now)
-  const day      = todayDayName()
-  const nowMins  = now.getHours() * 60 + now.getMinutes()
-  const winStart = nowMins + 150  // 2h30m from now
-  const winEnd   = nowMins + 180  // 3h00m from now
+  if (cronRunning) return
+  cronRunning = true
+
+  try {
+    const now = new Date()
+    const todayStr = toDateStr(now)
+    const day = todayDayName()
+    const nowMins = now.getHours() * 60 + now.getMinutes()
+
+    const winStart = nowMins + 150
+    const winEnd = nowMins + 180
+
+    // ───────── CANCELLATIONS ─────────
+    const { rows: canceled } = await query(`
+      SELECT cl.student_key, cl.student_name, cl.teacher_name,
+             cl.canceled_date::text AS canceled_date,
+             br.chat_id
+      FROM canceled_lessons cl
+      INNER JOIN parent_student_links psl ON psl.student_key = cl.student_key
+      INNER JOIN bot_registrations br ON br.telegram_username = psl.telegram_username
+      WHERE cl.notification_sent = FALSE
+    `)
+
+    for (const row of canceled) {
+      await safeSend(row.chat_id,
+        `🚫 <b>Lesson canceled</b>\n\n` +
+        `${row.student_name} — ${formatDate(row.canceled_date)}\n` +
+        `👩‍🏫 ${row.teacher_name}`
+      )
+
+      await query(
+        `UPDATE canceled_lessons 
+         SET notification_sent = TRUE 
+         WHERE student_key = $1 AND canceled_date = $2`,
+        [row.student_key, row.canceled_date]
+      )
+
+      await query(
+        `INSERT INTO lesson_reminders_sent (student_key, lesson_date)
+         VALUES ($1, $2)
+         ON CONFLICT DO NOTHING`,
+        [row.student_key, row.canceled_date]
+      )
+    }
+
+    // ───────── REMINDERS ─────────
+    const { rows: slots } = await query(`
+      SELECT sss.student_key, sss.student_name, sss.teacher_name, sss.lesson_time,
+             br.chat_id
+      FROM student_schedule_slots sss
+      INNER JOIN parent_student_links psl ON psl.student_key = sss.student_key
+      INNER JOIN bot_registrations br ON br.telegram_username = psl.telegram_username
+      WHERE sss.day_of_week = $1 AND sss.lesson_time != ''
+    `, [day])
+
+    for (const slot of slots) {
+      const [h, m] = slot.lesson_time.split(':').map(Number)
+      if (isNaN(h) || isNaN(m)) continue
+
+      const lessonMins = h * 60 + m
+      if (lessonMins < winStart || lessonMins > winEnd) continue
+
+      const { rows: already } = await query(
+        `SELECT 1 FROM lesson_reminders_sent 
+         WHERE student_key = $1 AND lesson_date = $2`,
+        [slot.student_key, todayStr]
+      )
+
+      if (already.length > 0) continue
+
+      await safeSend(slot.chat_id,
+        `⏰ <b>Lesson reminder</b>\n\n` +
+        `${slot.student_name} at ${slot.lesson_time}\n` +
+        `👩‍🏫 ${slot.teacher_name}`
+      )
+
+      await query(
+        `INSERT INTO lesson_reminders_sent (student_key, lesson_date)
+         VALUES ($1, $2)
+         ON CONFLICT DO NOTHING`,
+        [slot.student_key, todayStr]
+      )
+    }
+
+  } catch (err) {
+    console.error('[cron fatal]', err)
+  } finally {
+    cronRunning = false
+  }
+})
 
   // ── A. Cancellation notifications (highest priority) ─────────────────────
   try {
@@ -386,6 +480,7 @@ cron.schedule('* * * * *', async () => {
 
 // ── Launch ────────────────────────────────────────────────────────────────────
 const app = express()
+let cronRunning = false
 
 app.get('/', (req, res) => {
   res.send('Bot is running')
